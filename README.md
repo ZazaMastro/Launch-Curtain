@@ -9,6 +9,8 @@ way.
 The goal is simple: make launching PC games feel a little more like using a
 console.
 
+To force the screen to disappear, just press ESC on your keyboard.
+
 ## Features
 
 - Starts a loading curtain when Steam launches a game.
