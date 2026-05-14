@@ -9,7 +9,8 @@ import sys
 import time
 import shutil
 from ctypes import wintypes
-from typing import Any, Dict, List, Optional
+from urllib.parse import unquote, urlparse
+from typing import Any, Dict, List, Optional, Tuple
 
 import decky
 
@@ -17,9 +18,10 @@ import decky
 PLAYHUB_YELLOW = "#FCCC01"
 
 DEFAULT_SETTINGS: Dict[str, Any] = {
-    "auto_mode": False,
-    "curtain_timeout": 45,
-    "launch_curtain_max_seconds": 12,
+    "settings_version": 2,
+    "auto_mode": True,
+    "curtain_timeout": 15,
+    "launch_curtain_max_seconds": 15,
     "min_visible_seconds": 2,
     "game_settle_seconds": 2,
     "title": "",
@@ -44,6 +46,10 @@ SW_RESTORE = 9
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 TH32CS_SNAPPROCESS = 0x00000002
 INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+WM_CLOSE = 0x0010
+MONITOR_DEFAULTTONEAREST = 0x00000002
+FULLSCREEN_TOLERANCE = 18
+APP_ID_MAX = 0x100000000
 
 STEAM_PROCESS_NAMES = {
     "steam.exe",
@@ -89,6 +95,15 @@ class PROCESSENTRY32W(ctypes.Structure):
         ("pcPriClassBase", ctypes.c_long),
         ("dwFlags", wintypes.DWORD),
         ("szExeFile", wintypes.WCHAR * 260)
+    ]
+
+
+class MONITORINFO(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("rcMonitor", wintypes.RECT),
+        ("rcWork", wintypes.RECT),
+        ("dwFlags", wintypes.DWORD)
     ]
 
 
@@ -140,7 +155,7 @@ def _process_snapshot() -> Dict[int, Dict[str, Any]]:
     return processes
 
 
-def _process_name(pid: int) -> str:
+def _process_image_path(pid: int) -> str:
     if not _is_windows() or pid <= 0:
         return ""
 
@@ -167,9 +182,14 @@ def _process_name(pid: int) -> str:
         ok = kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(buffer_size))
         if not ok:
             return ""
-        return os.path.basename(buffer.value)
+        return buffer.value
     finally:
         kernel32.CloseHandle(handle)
+
+
+def _process_name(pid: int) -> str:
+    image_path = _process_image_path(pid)
+    return os.path.basename(image_path) if image_path else ""
 
 
 def _window_title(hwnd: int) -> str:
@@ -252,6 +272,108 @@ def _visible_windows(limit: int = 18) -> List[Dict[str, Any]]:
     return windows
 
 
+def _windows_for_pid(pid: int, limit: int = 24) -> List[int]:
+    if not _is_windows() or pid <= 0:
+        return []
+
+    user32 = ctypes.windll.user32
+    user32.IsWindowVisible.argtypes = [wintypes.HWND]
+    user32.IsWindowVisible.restype = wintypes.BOOL
+    user32.EnumWindows.argtypes = [ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM), wintypes.LPARAM]
+    user32.EnumWindows.restype = wintypes.BOOL
+
+    windows: List[int] = []
+
+    def callback(hwnd: int, _lparam: int) -> bool:
+        if len(windows) >= limit:
+            return False
+        if user32.IsWindowVisible(hwnd) and _window_pid(hwnd) == pid:
+            windows.append(int(hwnd))
+        return True
+
+    enum_proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)(callback)
+    user32.EnumWindows(enum_proc, 0)
+    return windows
+
+
+def _window_rect(hwnd: int) -> Optional[wintypes.RECT]:
+    if not _is_windows() or hwnd <= 0:
+        return None
+
+    user32 = ctypes.windll.user32
+    user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+    user32.GetWindowRect.restype = wintypes.BOOL
+
+    rect = wintypes.RECT()
+    if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+        return None
+    return rect
+
+
+def _monitor_rect_for_window(hwnd: int) -> Optional[wintypes.RECT]:
+    if not _is_windows() or hwnd <= 0:
+        return None
+
+    user32 = ctypes.windll.user32
+    user32.MonitorFromWindow.argtypes = [wintypes.HWND, wintypes.DWORD]
+    user32.MonitorFromWindow.restype = wintypes.HANDLE
+    user32.GetMonitorInfoW.argtypes = [wintypes.HANDLE, ctypes.POINTER(MONITORINFO)]
+    user32.GetMonitorInfoW.restype = wintypes.BOOL
+
+    monitor = user32.MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
+    if not monitor:
+        return None
+
+    info = MONITORINFO()
+    info.cbSize = ctypes.sizeof(MONITORINFO)
+    if not user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+        return None
+    return info.rcMonitor
+
+
+def _window_is_fullscreen(hwnd: int) -> bool:
+    rect = _window_rect(hwnd)
+    monitor = _monitor_rect_for_window(hwnd)
+    if rect is None or monitor is None:
+        return False
+
+    window_width = rect.right - rect.left
+    window_height = rect.bottom - rect.top
+    monitor_width = monitor.right - monitor.left
+    monitor_height = monitor.bottom - monitor.top
+
+    if window_width < monitor_width - FULLSCREEN_TOLERANCE:
+        return False
+    if window_height < monitor_height - FULLSCREEN_TOLERANCE:
+        return False
+
+    return (
+        rect.left <= monitor.left + FULLSCREEN_TOLERANCE
+        and rect.top <= monitor.top + FULLSCREEN_TOLERANCE
+        and rect.right >= monitor.right - FULLSCREEN_TOLERANCE
+        and rect.bottom >= monitor.bottom - FULLSCREEN_TOLERANCE
+    )
+
+
+def _pid_has_fullscreen_window(pid: int) -> bool:
+    return any(_window_is_fullscreen(hwnd) for hwnd in _windows_for_pid(pid))
+
+
+def _post_close_to_process_windows(pid: int) -> bool:
+    if not _is_windows() or pid <= 0:
+        return False
+
+    user32 = ctypes.windll.user32
+    user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+    user32.PostMessageW.restype = wintypes.BOOL
+
+    posted = False
+    for hwnd in _windows_for_pid(pid, limit=12):
+        if user32.PostMessageW(hwnd, WM_CLOSE, 0, 0):
+            posted = True
+    return posted
+
+
 def _focus_window(hwnd: int) -> bool:
     if not _is_windows() or hwnd <= 0:
         return False
@@ -275,6 +397,267 @@ def _find_steam_window() -> Optional[int]:
     return None
 
 
+def _steam_root_candidates(processes: Optional[Dict[int, Dict[str, Any]]] = None) -> List[str]:
+    candidates: List[str] = []
+
+    for process in (processes or _process_snapshot()).values():
+        if str(process.get("process", "")).lower() != "steam.exe":
+            continue
+        image_path = _process_image_path(int(process.get("pid", 0)))
+        if image_path:
+            candidates.append(os.path.dirname(image_path))
+
+    try:
+        import winreg
+
+        for root, subkey in (
+            (winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam"),
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Valve\Steam")
+        ):
+            try:
+                with winreg.OpenKey(root, subkey) as key:
+                    for value_name in ("SteamPath", "InstallPath"):
+                        try:
+                            value, _value_type = winreg.QueryValueEx(key, value_name)
+                            if value:
+                                candidates.append(str(value))
+                        except OSError:
+                            pass
+            except OSError:
+                pass
+    except Exception:
+        pass
+
+    candidates.extend([
+        r"C:\Program Files (x86)\Steam",
+        r"C:\Program Files\Steam"
+    ])
+
+    unique: List[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        normalized = os.path.normpath(candidate)
+        key = normalized.lower()
+        if key not in seen and os.path.isdir(normalized):
+            unique.append(normalized)
+            seen.add(key)
+    return unique
+
+
+def _find_steam_app_logo_exact(app_id: Optional[int], processes: Optional[Dict[int, Dict[str, Any]]] = None) -> str:
+    if not app_id:
+        return ""
+
+    app_id_text = str(app_id)
+    custom_grid_names = [
+        f"{app_id_text}_logo.png",
+        f"{app_id_text}_logo.jpg",
+        f"{app_id_text}_logo.jpeg",
+        f"{app_id_text}_logo.webp",
+        f"{app_id_text}.png",
+        f"{app_id_text}.jpg",
+        f"{app_id_text}.jpeg",
+        f"{app_id_text}.webp",
+        f"{app_id_text}p.png",
+        f"{app_id_text}p.jpg",
+        f"{app_id_text}p.jpeg",
+        f"{app_id_text}p.webp",
+        f"{app_id_text}_hero.png",
+        f"{app_id_text}_hero.jpg",
+        f"{app_id_text}_hero.jpeg",
+        f"{app_id_text}_hero.webp",
+        f"{app_id_text}_icon.png",
+        f"{app_id_text}_icon.jpg",
+        f"{app_id_text}_icon.ico"
+    ]
+    library_cache_names = [
+        f"{app_id_text}_logo.png",
+        f"{app_id_text}_logo.jpg",
+        f"{app_id_text}_logo.jpeg",
+        f"{app_id_text}_logo.webp",
+        f"{app_id_text}_library_logo.png",
+        f"{app_id_text}_header.jpg",
+        f"{app_id_text}_capsule_616x353.jpg",
+        f"{app_id_text}_library_600x900.jpg",
+        f"{app_id_text}_library_hero.jpg"
+    ]
+    extensions = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".ico")
+
+    for steam_root in _steam_root_candidates(processes):
+        userdata_dir = os.path.join(steam_root, "userdata")
+        grid_dirs: List[str] = []
+        if os.path.isdir(userdata_dir):
+            try:
+                grid_dirs = [
+                    os.path.join(userdata_dir, user_id, "config", "grid")
+                    for user_id in os.listdir(userdata_dir)
+                    if os.path.isdir(os.path.join(userdata_dir, user_id, "config", "grid"))
+                ]
+            except OSError:
+                grid_dirs = []
+
+        for grid_dir in grid_dirs:
+            for name in custom_grid_names:
+                path = os.path.join(grid_dir, name)
+                if os.path.exists(path):
+                    return path
+
+            try:
+                matches = [
+                    os.path.join(grid_dir, name)
+                    for name in os.listdir(grid_dir)
+                    if _filename_belongs_to_app_id(name, app_id_text, extensions)
+                ]
+            except OSError:
+                matches = []
+
+            if matches:
+                def custom_art_priority(path: str) -> Tuple[int, str]:
+                    basename = os.path.basename(path).lower()
+                    stem, _extension = os.path.splitext(basename)
+                    if "_logo" in stem:
+                        return (0, basename)
+                    if stem == app_id_text:
+                        return (1, basename)
+                    if stem == f"{app_id_text}p":
+                        return (2, basename)
+                    if "_hero" in stem:
+                        return (3, basename)
+                    if "_icon" in stem:
+                        return (4, basename)
+                    return (5, basename)
+
+                matches.sort(key=custom_art_priority)
+                return matches[0]
+
+        cache_dir = os.path.join(steam_root, "appcache", "librarycache")
+        if not os.path.isdir(cache_dir):
+            continue
+
+        for name in library_cache_names:
+            path = os.path.join(cache_dir, name)
+            if os.path.exists(path):
+                return path
+
+        try:
+            matches = [
+                os.path.join(cache_dir, name)
+                for name in os.listdir(cache_dir)
+                if _filename_belongs_to_app_id(name, app_id_text, extensions)
+            ]
+        except OSError:
+            matches = []
+
+        if matches:
+            matches.sort(key=lambda path: (
+                "logo" not in os.path.basename(path).lower(),
+                "header" not in os.path.basename(path).lower(),
+                os.path.basename(path).lower()
+            ))
+            return matches[0]
+
+    return ""
+
+
+def _normalize_app_id(app_id: Any) -> Optional[int]:
+    if app_id is None:
+        return None
+
+    try:
+        normalized = int(app_id)
+    except (TypeError, ValueError):
+        return None
+
+    if normalized < 0:
+        normalized = ctypes.c_uint32(normalized).value
+    elif normalized >= APP_ID_MAX:
+        upper_app_id = (normalized >> 32) & 0xFFFFFFFF
+        normalized = upper_app_id if upper_app_id >= 0x80000000 else 0
+
+    if 0 < normalized < APP_ID_MAX:
+        return normalized
+    return None
+
+
+def _app_id_candidates(app_id: Optional[int], include_shortcut_aliases: bool = False) -> List[int]:
+    normalized = _normalize_app_id(app_id)
+    if normalized is None:
+        return []
+
+    candidates = [normalized]
+    if include_shortcut_aliases:
+        if 0 < normalized < 0x80000000:
+            candidates.append(normalized | 0x80000000)
+        if normalized >= 0x80000000:
+            candidates.append(normalized & 0x7FFFFFFF)
+
+    unique: List[int] = []
+    seen: set[int] = set()
+    for candidate in candidates:
+        if 0 < candidate < APP_ID_MAX and candidate not in seen:
+            unique.append(candidate)
+            seen.add(candidate)
+    return unique
+
+
+def _find_steam_app_logo(
+    app_id: Optional[int],
+    processes: Optional[Dict[int, Dict[str, Any]]] = None,
+    include_shortcut_aliases: bool = False
+) -> str:
+    for candidate in _app_id_candidates(app_id, include_shortcut_aliases):
+        logo = _find_steam_app_logo_exact(candidate, processes)
+        if logo:
+            return logo
+    return ""
+
+
+def _filename_belongs_to_app_id(filename: str, app_id_text: str, extensions: Tuple[str, ...]) -> bool:
+    lower = filename.lower()
+    if not lower.endswith(extensions):
+        return False
+
+    stem, _extension = os.path.splitext(lower)
+    return (
+        stem == app_id_text
+        or stem == f"{app_id_text}p"
+        or stem.startswith(f"{app_id_text}_")
+        or stem.startswith(f"{app_id_text}-")
+    )
+
+
+def _local_path_from_logo_source(source: str) -> str:
+    if not source:
+        return ""
+
+    source = source.strip().strip('"').strip("'")
+    if source.startswith("url(") and source.endswith(")"):
+        source = source[4:-1].strip().strip('"').strip("'")
+
+    parsed = urlparse(source)
+    if parsed.scheme == "file":
+        path = unquote(parsed.path)
+        if parsed.netloc:
+            path = f"//{parsed.netloc}{path}"
+        if len(path) >= 3 and path[0] == "/" and path[2] == ":":
+            path = path[1:]
+        path = path.replace("/", os.sep)
+        return path if os.path.exists(path) else ""
+
+    if parsed.scheme:
+        return ""
+
+    maybe_path = source.replace("/", os.sep)
+    return maybe_path if os.path.exists(maybe_path) else ""
+
+
+def _remote_logo_source(source: str) -> str:
+    parsed = urlparse(source.strip()) if source else None
+    if parsed and parsed.scheme in {"http", "https"}:
+        return source.strip()
+    return ""
+
+
 class Plugin:
     def __init__(self) -> None:
         self.settings: Dict[str, Any] = dict(DEFAULT_SETTINGS)
@@ -283,9 +666,13 @@ class Plugin:
         self.last_curtain_started_at = 0.0
         self.launch_pending_until = 0.0
         self.game_seen_since = 0.0
+        self.current_launch_app_id: Optional[int] = None
+        self.current_launch_logo_path = ""
+        self.current_launch_logo_source = ""
         self.known_processes: Dict[int, Dict[str, Any]] = {}
         self.launch_chain_pids: Dict[int, float] = {}
-        self.launch_game_candidates: Dict[int, float] = {}
+        self.launch_game_candidates: Dict[int, Dict[str, float]] = {}
+        self.launch_game_fullscreen_since: Dict[int, float] = {}
 
     async def _main(self) -> None:
         self.settings = self._load_settings()
@@ -310,10 +697,28 @@ class Plugin:
         try:
             with open(path, "r", encoding="utf-8") as file:
                 data = json.load(file)
+            stored_settings_version = int(data.get("settings_version", 0) or 0)
             settings = dict(DEFAULT_SETTINGS)
             settings.update(data)
             if str(settings.get("accent", "")).lower() in {"", "#ffffff", "white"}:
                 settings["accent"] = PLAYHUB_YELLOW
+            try:
+                settings["curtain_timeout"] = int(settings.get("curtain_timeout", 15))
+            except (TypeError, ValueError):
+                settings["curtain_timeout"] = 15
+            try:
+                settings["launch_curtain_max_seconds"] = int(settings.get("launch_curtain_max_seconds", 15))
+            except (TypeError, ValueError):
+                settings["launch_curtain_max_seconds"] = int(settings["curtain_timeout"])
+            valid_timeouts = set(range(5, 65, 5))
+            if settings["curtain_timeout"] not in valid_timeouts:
+                settings["curtain_timeout"] = 15
+            if settings["launch_curtain_max_seconds"] not in valid_timeouts:
+                settings["launch_curtain_max_seconds"] = int(settings["curtain_timeout"])
+            if stored_settings_version < 2 and settings["curtain_timeout"] == 5 and settings["launch_curtain_max_seconds"] == 5:
+                settings["curtain_timeout"] = 15
+                settings["launch_curtain_max_seconds"] = 15
+            settings["settings_version"] = int(DEFAULT_SETTINGS["settings_version"])
             return settings
         except Exception as error:
             decky.logger.warning(f"Could not load settings: {error}")
@@ -327,6 +732,7 @@ class Plugin:
         self.known_processes = _process_snapshot()
         self.launch_chain_pids = {}
         self.launch_game_candidates = {}
+        self.launch_game_fullscreen_since = {}
 
     def _is_curtain_running(self) -> bool:
         return self.overlay_process is not None and self.overlay_process.poll() is None
@@ -334,11 +740,19 @@ class Plugin:
     def _overlay_script(self) -> str:
         return os.path.join(os.path.dirname(__file__), "helpers", "curtain_overlay.ps1")
 
+    def _default_logo_path(self) -> str:
+        return os.path.join(os.path.dirname(__file__), "assets", "base_logo.png")
+
     def _logo_path(self) -> str:
+        if self.current_launch_logo_path and os.path.exists(self.current_launch_logo_path):
+            return self.current_launch_logo_path
+        if self.current_launch_logo_source:
+            return self.current_launch_logo_source
+
         custom_logo = str(self.settings.get("custom_logo_path", "")).strip()
         if custom_logo and os.path.exists(custom_logo):
             return custom_logo
-        return os.path.join(os.path.dirname(__file__), "assets", "base_logo.png")
+        return self._default_logo_path()
 
     def _powershell_path(self) -> str:
         system_root = os.environ.get("SystemRoot", r"C:\Windows")
@@ -354,7 +768,9 @@ class Plugin:
         return shutil.which("powershell.exe") or "powershell.exe"
 
     async def get_settings(self) -> Dict[str, Any]:
-        return dict(self.settings)
+        settings = dict(self.settings)
+        settings["default_logo_path"] = self._default_logo_path()
+        return settings
 
     async def save_settings(self, settings: Dict[str, Any]) -> Dict[str, Any]:
         for key in DEFAULT_SETTINGS:
@@ -379,6 +795,34 @@ class Plugin:
             "visible_windows": _visible_windows(limit=8)
         }
 
+    async def resolve_game_logo(self, app_id: int) -> Dict[str, Any]:
+        include_shortcut_aliases = False
+        raw_app_id: Any = app_id
+        if isinstance(app_id, dict):
+            raw_app_id = app_id.get("app_id") or app_id.get("appid")
+            include_shortcut_aliases = bool(app_id.get("is_shortcut"))
+
+        normalized_app_id = _normalize_app_id(raw_app_id)
+        if normalized_app_id is None:
+            return {"ok": False, "logo_source": "", "message": "Invalid appid."}
+
+        logo_path = _find_steam_app_logo(normalized_app_id, self.known_processes, include_shortcut_aliases)
+        if logo_path:
+            return {"ok": True, "logo_source": logo_path, "message": "Found Steam grid logo."}
+
+        if include_shortcut_aliases:
+            return {
+                "ok": False,
+                "logo_source": "",
+                "message": "No local SteamGridDB logo found for this non-Steam shortcut."
+            }
+
+        return {
+            "ok": True,
+            "logo_source": f"https://cdn.cloudflare.steamstatic.com/steam/apps/{normalized_app_id}/logo.png",
+            "message": "Using Steam CDN logo."
+        }
+
     async def show_curtain(self, timeout_override: Optional[int] = None) -> Dict[str, Any]:
         if not _is_windows():
             return {"ok": False, "message": "Launch Curtain currently targets Windows only."}
@@ -390,7 +834,11 @@ class Plugin:
         if not os.path.exists(script):
             return {"ok": False, "message": f"Overlay helper not found: {script}"}
 
-        timeout = int(timeout_override or self.settings.get("curtain_timeout", DEFAULT_SETTINGS["curtain_timeout"]))
+        timeout_value = timeout_override if timeout_override is not None else self.settings.get(
+            "curtain_timeout",
+            DEFAULT_SETTINGS["curtain_timeout"]
+        )
+        timeout = int(timeout_value)
         args = [
             self._powershell_path(),
             "-NoLogo",
@@ -412,7 +860,7 @@ class Plugin:
             "-Logo",
             self._logo_path(),
             "-Timeout",
-            str(max(5, timeout))
+            str(max(0, timeout))
         ]
 
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -425,29 +873,75 @@ class Plugin:
         self.game_seen_since = 0.0
         return {"ok": True, "message": "Curtain visible."}
 
-    async def launch_requested(self, reason: str = "steam") -> Dict[str, Any]:
-        timeout = int(self.settings.get("launch_curtain_max_seconds", DEFAULT_SETTINGS["launch_curtain_max_seconds"]))
-        pending_seconds = min(max(6, timeout), 16)
+    async def launch_requested(self, request: Any = "steam") -> Dict[str, Any]:
+        reason = "steam"
+        app_id: Optional[int] = None
+        logo_source = ""
+        is_shortcut = False
+
+        if isinstance(request, dict):
+            reason = str(request.get("reason") or reason)
+            is_shortcut = bool(request.get("is_shortcut"))
+            raw_app_id = request.get("app_id") or request.get("appid")
+            app_id = _normalize_app_id(raw_app_id)
+            logo_source = str(request.get("logo_source") or request.get("logo_path") or "")
+        elif isinstance(request, str):
+            reason = request
+
+        app_id_missing_is_allowed = (
+            isinstance(request, dict)
+            and not app_id
+            and (
+                reason.startswith("play button")
+                or reason.startswith("SteamClient.Apps.")
+            )
+        )
+        if isinstance(request, dict) and not app_id and not app_id_missing_is_allowed:
+            return {"ok": False, "message": "Launch ignored: no Steam game appid was provided."}
+
+        if self.settings.get("auto_mode"):
+            self._ensure_monitor()
+
+        timeout = int(self.settings.get(
+            "launch_curtain_max_seconds",
+            self.settings.get("curtain_timeout", DEFAULT_SETTINGS["curtain_timeout"])
+        ))
+        pending_seconds = min(max(5, timeout), 60)
         self.launch_pending_until = time.time() + pending_seconds
         self.game_seen_since = 0.0
+        self.current_launch_app_id = app_id
+        self.current_launch_logo_path = (
+            _local_path_from_logo_source(logo_source)
+            or _find_steam_app_logo(app_id, self.known_processes, is_shortcut)
+        )
+        self.current_launch_logo_source = "" if self.current_launch_logo_path else _remote_logo_source(logo_source)
 
-        result = await self.show_curtain(timeout_override=pending_seconds)
+        result = await self.show_curtain(timeout_override=0)
         if result.get("ok"):
             result["message"] = f"Curtain started for launch: {reason}."
         return result
 
     async def hide_curtain(self) -> Dict[str, Any]:
         if self._is_curtain_running() and self.overlay_process is not None:
-            self.overlay_process.terminate()
+            if not _post_close_to_process_windows(self.overlay_process.pid):
+                self.overlay_process.terminate()
             try:
-                self.overlay_process.wait(timeout=2)
+                self.overlay_process.wait(timeout=1.4)
             except subprocess.TimeoutExpired:
-                self.overlay_process.kill()
+                self.overlay_process.terminate()
+                try:
+                    self.overlay_process.wait(timeout=0.8)
+                except subprocess.TimeoutExpired:
+                    self.overlay_process.kill()
 
         self.overlay_process = None
         self.launch_pending_until = 0.0
         self.game_seen_since = 0.0
+        self.current_launch_app_id = None
+        self.current_launch_logo_path = ""
+        self.current_launch_logo_source = ""
         self.launch_game_candidates = {}
+        self.launch_game_fullscreen_since = {}
         return {"ok": True, "message": "Curtain hidden."}
 
     async def focus_steam(self) -> Dict[str, Any]:
@@ -514,6 +1008,9 @@ class Plugin:
         if not new_processes:
             return
 
+        if now >= self.launch_pending_until:
+            return
+
         source_pids = {
             pid
             for pid, process in processes.items()
@@ -541,13 +1038,9 @@ class Plugin:
             if process_name in IGNORED_LAUNCH_CHILDREN:
                 continue
 
-            timeout = int(self.settings.get("launch_curtain_max_seconds", DEFAULT_SETTINGS["launch_curtain_max_seconds"]))
-            pending_seconds = min(max(6, timeout), 16)
-            self.launch_pending_until = now + pending_seconds
             self.game_seen_since = 0.0
             if process_name not in launcher_names:
-                self.launch_game_candidates[pid] = now
-            await self.show_curtain(timeout_override=pending_seconds)
+                self.launch_game_candidates[pid] = {"first_seen": now}
             decky.logger.info(f"Launch Curtain detected process launch: {process_name} from {parent_name}")
             return
 
@@ -561,16 +1054,34 @@ class Plugin:
         visible_long_enough = now - self.last_curtain_started_at >= min_visible
 
         self.launch_game_candidates = {
-            pid: first_seen
-            for pid, first_seen in self.launch_game_candidates.items()
-            if pid in processes and now - first_seen <= 30
+            pid: data
+            for pid, data in self.launch_game_candidates.items()
+            if pid in processes and now - float(data.get("first_seen", now)) <= 30
+        }
+        self.launch_game_fullscreen_since = {
+            pid: fullscreen_since
+            for pid, fullscreen_since in self.launch_game_fullscreen_since.items()
+            if pid in self.launch_game_candidates
         }
 
-        for _pid, first_seen in self.launch_game_candidates.items():
-            if now - first_seen >= game_settle and visible_long_enough:
+        for pid, data in self.launch_game_candidates.items():
+            first_seen = float(data.get("first_seen", now))
+            if now - first_seen < 0.4:
+                continue
+
+            if _pid_has_fullscreen_window(pid):
+                if pid not in self.launch_game_fullscreen_since:
+                    self.launch_game_fullscreen_since[pid] = now
+                fullscreen_long_enough = now - self.launch_game_fullscreen_since[pid] >= game_settle
+            else:
+                self.launch_game_fullscreen_since.pop(pid, None)
+                fullscreen_long_enough = False
+
+            if fullscreen_long_enough and visible_long_enough:
                 self.launch_pending_until = 0.0
                 self.game_seen_since = 0.0
                 self.launch_game_candidates = {}
+                self.launch_game_fullscreen_since = {}
                 await self.hide_curtain()
                 return
 
@@ -582,6 +1093,7 @@ class Plugin:
             self.launch_pending_until = 0.0
             self.game_seen_since = 0.0
             self.launch_game_candidates = {}
+            self.launch_game_fullscreen_since = {}
             await self.hide_curtain()
 
     async def _monitor_foreground(self) -> None:
@@ -599,19 +1111,17 @@ class Plugin:
             foreground = _foreground_window()
             process = str(foreground.get("process", "")).lower()
             title = str(foreground.get("title", "")).lower()
+            foreground_hwnd = int(foreground.get("hwnd", 0) or 0)
 
             is_launcher = process in launcher_names
             is_overlay = process in {"powershell.exe", "pwsh.exe"} and "launch curtain" in title
             is_steam = process in {"steam.exe", "steamwebhelper.exe"}
-            is_launch_pending = time.time() < self.launch_pending_until
             looks_like_game = bool(process) and not is_launcher and not is_overlay and not is_steam
+            is_fullscreen_game = looks_like_game and _window_is_fullscreen(foreground_hwnd)
             min_visible = float(self.settings.get("min_visible_seconds", 2))
             game_settle = float(self.settings.get("game_settle_seconds", 2))
 
-            if is_launcher and not self._is_curtain_running():
-                await self.show_curtain()
-
-            if self._is_curtain_running() and looks_like_game:
+            if self._is_curtain_running() and is_fullscreen_game:
                 if self.game_seen_since <= 0:
                     self.game_seen_since = time.time()
 
@@ -623,9 +1133,5 @@ class Plugin:
                     await self.hide_curtain()
             else:
                 self.game_seen_since = 0.0
-
-            if self._is_curtain_running() and not is_launch_pending and not looks_like_game and not is_launcher and not is_overlay:
-                if time.time() - self.last_curtain_started_at >= min_visible:
-                    await self.hide_curtain()
 
             await asyncio.sleep(0.5)

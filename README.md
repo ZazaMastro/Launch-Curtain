@@ -14,10 +14,16 @@ console.
 ## Features
 
 - Starts a loading curtain when Steam launches a game.
-- Uses a black screen, centered logo, and three subtle loading dots.
+- Shows the game's Steam logo when possible, including Steam custom artwork
+  and SteamGridDB logos exposed by Steam, including non-Steam shortcuts.
+- Uses a black screen with a centered logo and a soft fade.
 - Includes a short in-Steam transition so the curtain appears immediately.
 - Adds a Windows fullscreen overlay for the messy launcher part.
-- Hides itself after the game appears or after a short safety timeout.
+- Hides itself after the real game window reaches fullscreen or after a short
+  safety timeout.
+- Can be dismissed with Escape or the close/back face button on common
+  controllers.
+- Keeps the Decky panel focused on settings, logo, and launch timeout only.
 - Lets you choose your own logo instead of the default Playhub logo.
 - Automatically follows the Steam/Decky UI language when possible.
 
@@ -44,9 +50,12 @@ The selected image is used in the center of the loading screen.
 
 You can switch back to the default Playhub logo at any time.
 
+When a Steam game logo is detected for a launch, that game logo is used first.
+Your custom logo and the Playhub logo remain fallbacks.
+
 ## Install
 
-Download the latest release zip, extract it, and copy the `LaunchCurtain` folder
+Download the latest release zip, extract it, and copy the `launch-curtain` folder
 to your Decky Loader plugins folder.
 
 Restart Decky Loader after replacing the folder.
@@ -76,4 +85,3 @@ dist/
 helpers/
 assets/
 ```
-
