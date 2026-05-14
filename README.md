@@ -1,4 +1,4 @@
-# Launch Curtain
+# Playhub | Launch Curtain
 
 Launch Curtain is a Decky Loader plugin for Windows.
 
