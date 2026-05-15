@@ -2,6 +2,8 @@
 
 Launch Curtain is a Decky Loader plugin for Windows.
 
+This plugin is a Windows exclusive, so if you are on Linux it's not gonna work.
+
 It shows a clean fullscreen loading screen when you start a game from Steam Big
 Picture, so desktop flashes, launchers, and awkward PC windows stay out of the
 way.
