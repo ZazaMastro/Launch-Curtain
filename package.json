@@ -1,6 +1,6 @@
 {
   "name": "decky-launch-curtain",
-  "version": "0.3.8",
+  "version": "0.3.12",
   "description": "A Decky Loader plugin for Windows that hides messy PC launch moments behind a simple console-style loading screen.",
   "type": "module",
   "scripts": {

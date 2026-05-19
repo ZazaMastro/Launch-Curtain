@@ -113,8 +113,65 @@ def _settings_path() -> str:
     return os.path.join(settings_dir, "launch-curtain.json")
 
 
+def _homebrew_root_from_plugin_path() -> str:
+    plugin_dir = os.path.dirname(__file__)
+    plugins_dir = os.path.dirname(plugin_dir)
+    if os.path.basename(plugins_dir).lower() == "plugins":
+        return os.path.dirname(plugins_dir)
+    return plugin_dir
+
+
+def _log_dir() -> str:
+    for attr in ("DECKY_PLUGIN_LOG_DIR", "DECKY_LOG_DIR"):
+        base = str(getattr(decky, attr, "") or "").strip()
+        if not base:
+            continue
+        if os.path.basename(base).lower() == "launch-curtain":
+            return base
+        return os.path.join(base, "launch-curtain")
+
+    return os.path.join(_homebrew_root_from_plugin_path(), "logs", "launch-curtain")
+
+
+def _log_path() -> str:
+    log_dir = _log_dir()
+    os.makedirs(log_dir, exist_ok=True)
+    return os.path.join(log_dir, "launch-curtain.log")
+
+
+def _write_debug_log(level: str, message: str) -> None:
+    try:
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        with open(_log_path(), "a", encoding="utf-8") as file:
+            file.write(f"[{timestamp}] [{level}] {message}\n")
+    except Exception:
+        pass
+
+
+def _log_info(message: str) -> None:
+    decky.logger.info(message)
+    _write_debug_log("INFO", message)
+
+
+def _log_warning(message: str) -> None:
+    decky.logger.warning(message)
+    _write_debug_log("WARN", message)
+
+
 def _is_windows() -> bool:
     return sys.platform.startswith("win")
+
+
+def _int_or_zero(value: Any) -> int:
+    if value is None:
+        return 0
+    raw_value = getattr(value, "value", value)
+    if raw_value is None:
+        return 0
+    try:
+        return int(raw_value)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _process_snapshot() -> Dict[int, Dict[str, Any]]:
@@ -156,6 +213,7 @@ def _process_snapshot() -> Dict[int, Dict[str, Any]]:
 
 
 def _process_image_path(pid: int) -> str:
+    pid = _int_or_zero(pid)
     if not _is_windows() or pid <= 0:
         return ""
 
@@ -193,6 +251,10 @@ def _process_name(pid: int) -> str:
 
 
 def _window_title(hwnd: int) -> str:
+    hwnd = _int_or_zero(hwnd)
+    if hwnd <= 0:
+        return ""
+
     user32 = ctypes.windll.user32
     user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
     user32.GetWindowTextLengthW.restype = ctypes.c_int
@@ -208,6 +270,10 @@ def _window_title(hwnd: int) -> str:
 
 
 def _window_pid(hwnd: int) -> int:
+    hwnd = _int_or_zero(hwnd)
+    if hwnd <= 0:
+        return 0
+
     user32 = ctypes.windll.user32
     user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
     user32.GetWindowThreadProcessId.restype = wintypes.DWORD
@@ -225,10 +291,13 @@ def _foreground_window() -> Dict[str, Any]:
     user32.GetForegroundWindow.argtypes = []
     user32.GetForegroundWindow.restype = wintypes.HWND
 
-    hwnd = user32.GetForegroundWindow()
+    hwnd = _int_or_zero(user32.GetForegroundWindow())
+    if hwnd <= 0:
+        return {"hwnd": 0, "title": "", "pid": 0, "process": "", "platform": sys.platform}
+
     pid = _window_pid(hwnd)
     return {
-        "hwnd": int(hwnd),
+        "hwnd": hwnd,
         "title": _window_title(hwnd),
         "pid": pid,
         "process": _process_name(pid),
@@ -249,6 +318,9 @@ def _visible_windows(limit: int = 18) -> List[Dict[str, Any]]:
     windows: List[Dict[str, Any]] = []
 
     def callback(hwnd: int, _lparam: int) -> bool:
+        hwnd = _int_or_zero(hwnd)
+        if hwnd <= 0:
+            return True
         if len(windows) >= limit:
             return False
         if not user32.IsWindowVisible(hwnd):
@@ -260,7 +332,7 @@ def _visible_windows(limit: int = 18) -> List[Dict[str, Any]]:
 
         pid = _window_pid(hwnd)
         windows.append({
-            "hwnd": int(hwnd),
+            "hwnd": hwnd,
             "title": title,
             "pid": pid,
             "process": _process_name(pid)
@@ -273,6 +345,7 @@ def _visible_windows(limit: int = 18) -> List[Dict[str, Any]]:
 
 
 def _windows_for_pid(pid: int, limit: int = 24) -> List[int]:
+    pid = _int_or_zero(pid)
     if not _is_windows() or pid <= 0:
         return []
 
@@ -285,10 +358,13 @@ def _windows_for_pid(pid: int, limit: int = 24) -> List[int]:
     windows: List[int] = []
 
     def callback(hwnd: int, _lparam: int) -> bool:
+        hwnd = _int_or_zero(hwnd)
+        if hwnd <= 0:
+            return True
         if len(windows) >= limit:
             return False
         if user32.IsWindowVisible(hwnd) and _window_pid(hwnd) == pid:
-            windows.append(int(hwnd))
+            windows.append(hwnd)
         return True
 
     enum_proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)(callback)
@@ -297,6 +373,7 @@ def _windows_for_pid(pid: int, limit: int = 24) -> List[int]:
 
 
 def _window_rect(hwnd: int) -> Optional[wintypes.RECT]:
+    hwnd = _int_or_zero(hwnd)
     if not _is_windows() or hwnd <= 0:
         return None
 
@@ -311,6 +388,7 @@ def _window_rect(hwnd: int) -> Optional[wintypes.RECT]:
 
 
 def _monitor_rect_for_window(hwnd: int) -> Optional[wintypes.RECT]:
+    hwnd = _int_or_zero(hwnd)
     if not _is_windows() or hwnd <= 0:
         return None
 
@@ -375,6 +453,7 @@ def _post_close_to_process_windows(pid: int) -> bool:
 
 
 def _focus_window(hwnd: int) -> bool:
+    hwnd = _int_or_zero(hwnd)
     if not _is_windows() or hwnd <= 0:
         return False
 
@@ -679,12 +758,23 @@ class Plugin:
         self._reset_process_tracking()
         if self.settings.get("auto_mode"):
             self._ensure_monitor()
-        decky.logger.info("Launch Curtain loaded")
+        _log_info(
+            "Launch Curtain loaded "
+            f"platform={sys.platform} "
+            f"python={sys.version.split()[0]} "
+            f"plugin_dir={os.path.dirname(__file__)} "
+            f"log={_log_path()} "
+            f"powershell={self._powershell_path()} "
+            f"overlay_exists={os.path.exists(self._overlay_script())} "
+            f"default_logo_exists={os.path.exists(self._default_logo_path())} "
+            f"auto_mode={bool(self.settings.get('auto_mode'))} "
+            f"timeout={self.settings.get('curtain_timeout')}"
+        )
 
     async def _unload(self) -> None:
         await self.stop_auto_mode()
         await self.hide_curtain()
-        decky.logger.info("Launch Curtain unloaded")
+        _log_info("Launch Curtain unloaded")
 
     async def _uninstall(self) -> None:
         await self.hide_curtain()
@@ -692,6 +782,7 @@ class Plugin:
     def _load_settings(self) -> Dict[str, Any]:
         path = _settings_path()
         if not os.path.exists(path):
+            _log_info(f"Settings file not found, using defaults: {path}")
             return dict(DEFAULT_SETTINGS)
 
         try:
@@ -719,14 +810,27 @@ class Plugin:
                 settings["curtain_timeout"] = 15
                 settings["launch_curtain_max_seconds"] = 15
             settings["settings_version"] = int(DEFAULT_SETTINGS["settings_version"])
+            _log_info(
+                "Settings loaded "
+                f"path={path} "
+                f"auto_mode={bool(settings.get('auto_mode'))} "
+                f"timeout={settings.get('curtain_timeout')} "
+                f"custom_logo={bool(settings.get('custom_logo_path'))}"
+            )
             return settings
         except Exception as error:
-            decky.logger.warning(f"Could not load settings: {error}")
+            _log_warning(f"Could not load settings from {path}: {error}")
             return dict(DEFAULT_SETTINGS)
 
     def _save_settings_to_disk(self) -> None:
         with open(_settings_path(), "w", encoding="utf-8") as file:
             json.dump(self.settings, file, indent=2)
+        _log_info(
+            "Settings saved "
+            f"auto_mode={bool(self.settings.get('auto_mode'))} "
+            f"timeout={self.settings.get('curtain_timeout')} "
+            f"custom_logo={bool(self.settings.get('custom_logo_path'))}"
+        )
 
     def _reset_process_tracking(self) -> None:
         self.known_processes = _process_snapshot()
@@ -787,12 +891,24 @@ class Plugin:
         return dict(self.settings)
 
     async def get_status(self) -> Dict[str, Any]:
+        try:
+            foreground = _foreground_window()
+        except Exception as error:
+            _log_warning(f"Could not read foreground window: {error}")
+            foreground = {"hwnd": 0, "title": "", "pid": 0, "process": "", "platform": sys.platform}
+
+        try:
+            visible_windows = _visible_windows(limit=8)
+        except Exception as error:
+            _log_warning(f"Could not read visible windows: {error}")
+            visible_windows = []
+
         return {
             "is_windows": _is_windows(),
             "curtain_running": self._is_curtain_running(),
             "auto_mode": bool(self.settings.get("auto_mode")),
-            "foreground": _foreground_window(),
-            "visible_windows": _visible_windows(limit=8)
+            "foreground": foreground,
+            "visible_windows": visible_windows
         }
 
     async def resolve_game_logo(self, app_id: int) -> Dict[str, Any]:
@@ -824,14 +940,18 @@ class Plugin:
         }
 
     async def show_curtain(self, timeout_override: Optional[int] = None) -> Dict[str, Any]:
+        _log_info(f"show_curtain requested timeout_override={timeout_override}")
         if not _is_windows():
+            _log_warning(f"show_curtain refused: unsupported platform={sys.platform}")
             return {"ok": False, "message": "Launch Curtain currently targets Windows only."}
 
         if self._is_curtain_running():
+            _log_info(f"show_curtain ignored: already visible pid={self.overlay_process.pid if self.overlay_process else 0}")
             return {"ok": True, "message": "Curtain already visible."}
 
         script = self._overlay_script()
         if not os.path.exists(script):
+            _log_warning(f"show_curtain failed: overlay helper not found: {script}")
             return {"ok": False, "message": f"Overlay helper not found: {script}"}
 
         timeout_value = timeout_override if timeout_override is not None else self.settings.get(
@@ -860,17 +980,33 @@ class Plugin:
             "-Logo",
             self._logo_path(),
             "-Timeout",
-            str(max(0, timeout))
+            str(max(0, timeout)),
+            "-LogPath",
+            _log_path()
         ]
 
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        self.overlay_process = subprocess.Popen(
-            args,
-            cwd=os.path.dirname(__file__),
-            creationflags=creationflags
-        )
+        try:
+            self.overlay_process = subprocess.Popen(
+                args,
+                cwd=os.path.dirname(__file__),
+                creationflags=creationflags
+            )
+        except Exception as error:
+            _log_warning(
+                "show_curtain failed to start overlay "
+                f"powershell={self._powershell_path()} script={script} error={error}"
+            )
+            return {"ok": False, "message": f"Could not start Launch Curtain overlay: {error}"}
+
         self.last_curtain_started_at = time.time()
         self.game_seen_since = 0.0
+        _log_info(
+            "show_curtain started overlay "
+            f"pid={self.overlay_process.pid if self.overlay_process else 0} "
+            f"timeout={timeout} "
+            f"logo={self._logo_path()}"
+        )
         return {"ok": True, "message": "Curtain visible."}
 
     async def launch_requested(self, request: Any = "steam") -> Dict[str, Any]:
@@ -888,6 +1024,15 @@ class Plugin:
         elif isinstance(request, str):
             reason = request
 
+        _log_info(
+            "launch_requested "
+            f"reason={reason} "
+            f"app_id={app_id or 0} "
+            f"is_shortcut={is_shortcut} "
+            f"logo_source_present={bool(logo_source)} "
+            f"auto_mode={bool(self.settings.get('auto_mode'))}"
+        )
+
         app_id_missing_is_allowed = (
             isinstance(request, dict)
             and not app_id
@@ -897,6 +1042,7 @@ class Plugin:
             )
         )
         if isinstance(request, dict) and not app_id and not app_id_missing_is_allowed:
+            _log_warning(f"launch_requested ignored: no appid reason={reason}")
             return {"ok": False, "message": "Launch ignored: no Steam game appid was provided."}
 
         if self.settings.get("auto_mode"):
@@ -916,6 +1062,14 @@ class Plugin:
         )
         self.current_launch_logo_source = "" if self.current_launch_logo_path else _remote_logo_source(logo_source)
 
+        _log_info(
+            "launch pending armed "
+            f"app_id={app_id or 0} "
+            f"pending_seconds={pending_seconds} "
+            f"local_logo={bool(self.current_launch_logo_path)} "
+            f"remote_logo={bool(self.current_launch_logo_source)}"
+        )
+
         result = await self.show_curtain(timeout_override=0)
         if result.get("ok"):
             result["message"] = f"Curtain started for launch: {reason}."
@@ -923,15 +1077,19 @@ class Plugin:
 
     async def hide_curtain(self) -> Dict[str, Any]:
         if self._is_curtain_running() and self.overlay_process is not None:
+            _log_info(f"hide_curtain requested overlay_pid={self.overlay_process.pid}")
             if not _post_close_to_process_windows(self.overlay_process.pid):
+                _log_warning(f"hide_curtain WM_CLOSE failed, terminating pid={self.overlay_process.pid}")
                 self.overlay_process.terminate()
             try:
                 self.overlay_process.wait(timeout=1.4)
             except subprocess.TimeoutExpired:
+                _log_warning(f"hide_curtain timed out, terminating pid={self.overlay_process.pid}")
                 self.overlay_process.terminate()
                 try:
                     self.overlay_process.wait(timeout=0.8)
                 except subprocess.TimeoutExpired:
+                    _log_warning(f"hide_curtain timed out again, killing pid={self.overlay_process.pid}")
                     self.overlay_process.kill()
 
         self.overlay_process = None
@@ -960,6 +1118,7 @@ class Plugin:
         return _visible_windows(limit=30)
 
     async def start_auto_mode(self) -> Dict[str, Any]:
+        _log_info("start_auto_mode requested")
         self.settings["auto_mode"] = True
         self._save_settings_to_disk()
         self._reset_process_tracking()
@@ -967,6 +1126,7 @@ class Plugin:
         return {"ok": True, "message": "Auto mode enabled."}
 
     async def stop_auto_mode(self) -> Dict[str, Any]:
+        _log_info("stop_auto_mode requested")
         self.settings["auto_mode"] = False
         self._save_settings_to_disk()
         if self.monitor_task is not None:
@@ -980,6 +1140,7 @@ class Plugin:
 
     def _ensure_monitor(self) -> None:
         if self.monitor_task is None or self.monitor_task.done():
+            _log_info("Starting foreground/process monitor")
             self.monitor_task = asyncio.get_event_loop().create_task(self._monitor_foreground())
 
     async def _monitor_process_launches(
@@ -1041,7 +1202,14 @@ class Plugin:
             self.game_seen_since = 0.0
             if process_name not in launcher_names:
                 self.launch_game_candidates[pid] = {"first_seen": now}
-            decky.logger.info(f"Launch Curtain detected process launch: {process_name} from {parent_name}")
+            _log_info(
+                "Detected launch child "
+                f"process={process_name} "
+                f"pid={pid} "
+                f"parent={parent_name} "
+                f"parent_pid={parent_pid} "
+                f"candidate={process_name not in launcher_names}"
+            )
             return
 
     async def _hide_for_settled_process_candidate(self, processes: Dict[int, Dict[str, Any]]) -> None:
@@ -1078,6 +1246,12 @@ class Plugin:
                 fullscreen_long_enough = False
 
             if fullscreen_long_enough and visible_long_enough:
+                _log_info(
+                    "Hiding curtain: process candidate reached fullscreen "
+                    f"pid={pid} "
+                    f"settle_seconds={game_settle} "
+                    f"visible_seconds={now - self.last_curtain_started_at:.2f}"
+                )
                 self.launch_pending_until = 0.0
                 self.game_seen_since = 0.0
                 self.launch_game_candidates = {}
@@ -1090,6 +1264,7 @@ class Plugin:
             return
 
         if time.time() >= self.launch_pending_until:
+            _log_info("Hiding curtain: timeout reached")
             self.launch_pending_until = 0.0
             self.game_seen_since = 0.0
             self.launch_game_candidates = {}
@@ -1101,37 +1276,49 @@ class Plugin:
             str(name).lower()
             for name in self.settings.get("launcher_processes", DEFAULT_SETTINGS["launcher_processes"])
         }
+        _log_info(f"Monitor loop started launcher_names={sorted(launcher_names)}")
 
         while bool(self.settings.get("auto_mode")):
-            processes = _process_snapshot()
-            await self._monitor_process_launches(processes, launcher_names)
-            await self._hide_for_settled_process_candidate(processes)
-            await self._hide_expired_launch_curtain()
+            try:
+                processes = _process_snapshot()
+                await self._monitor_process_launches(processes, launcher_names)
+                await self._hide_for_settled_process_candidate(processes)
+                await self._hide_expired_launch_curtain()
 
-            foreground = _foreground_window()
-            process = str(foreground.get("process", "")).lower()
-            title = str(foreground.get("title", "")).lower()
-            foreground_hwnd = int(foreground.get("hwnd", 0) or 0)
+                foreground = _foreground_window()
+                process = str(foreground.get("process", "")).lower()
+                title = str(foreground.get("title", "")).lower()
+                foreground_hwnd = int(foreground.get("hwnd", 0) or 0)
 
-            is_launcher = process in launcher_names
-            is_overlay = process in {"powershell.exe", "pwsh.exe"} and "launch curtain" in title
-            is_steam = process in {"steam.exe", "steamwebhelper.exe"}
-            looks_like_game = bool(process) and not is_launcher and not is_overlay and not is_steam
-            is_fullscreen_game = looks_like_game and _window_is_fullscreen(foreground_hwnd)
-            min_visible = float(self.settings.get("min_visible_seconds", 2))
-            game_settle = float(self.settings.get("game_settle_seconds", 2))
+                is_launcher = process in launcher_names
+                is_overlay = process in {"powershell.exe", "pwsh.exe"} and "launch curtain" in title
+                is_steam = process in {"steam.exe", "steamwebhelper.exe"}
+                looks_like_game = bool(process) and not is_launcher and not is_overlay and not is_steam
+                is_fullscreen_game = looks_like_game and _window_is_fullscreen(foreground_hwnd)
+                min_visible = float(self.settings.get("min_visible_seconds", 2))
+                game_settle = float(self.settings.get("game_settle_seconds", 2))
 
-            if self._is_curtain_running() and is_fullscreen_game:
-                if self.game_seen_since <= 0:
-                    self.game_seen_since = time.time()
+                if self._is_curtain_running() and is_fullscreen_game:
+                    if self.game_seen_since <= 0:
+                        self.game_seen_since = time.time()
 
-                game_is_settled = time.time() - self.game_seen_since >= game_settle
-                curtain_was_visible = time.time() - self.last_curtain_started_at >= min_visible
-                if game_is_settled and curtain_was_visible:
-                    self.launch_pending_until = 0.0
+                    game_is_settled = time.time() - self.game_seen_since >= game_settle
+                    curtain_was_visible = time.time() - self.last_curtain_started_at >= min_visible
+                    if game_is_settled and curtain_was_visible:
+                        _log_info(
+                            "Hiding curtain: foreground fullscreen game settled "
+                            f"process={process} "
+                            f"title={foreground.get('title', '')} "
+                            f"hwnd={foreground_hwnd}"
+                        )
+                        self.launch_pending_until = 0.0
+                        self.game_seen_since = 0.0
+                        await self.hide_curtain()
+                else:
                     self.game_seen_since = 0.0
-                    await self.hide_curtain()
-            else:
-                self.game_seen_since = 0.0
+            except Exception as error:
+                _log_warning(f"Monitor tick failed: {error}")
 
             await asyncio.sleep(0.5)
+
+        _log_info("Monitor loop stopped")

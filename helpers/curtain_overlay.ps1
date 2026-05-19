@@ -3,14 +3,42 @@ param(
     [string]$Subtitle = "",
     [string]$Accent = "#FFFFFF",
     [string]$Logo = "",
-    [int]$Timeout = 45
+    [int]$Timeout = 45,
+    [string]$LogPath = ""
 )
 
 $ErrorActionPreference = "Stop"
 
-Add-Type -AssemblyName PresentationFramework
-Add-Type -AssemblyName PresentationCore
-Add-Type -AssemblyName WindowsBase
+function Write-OverlayLog {
+    param([string]$Message)
+    if (-not $LogPath) {
+        return
+    }
+
+    try {
+        $logDir = Split-Path -Parent $LogPath
+        if ($logDir) {
+            New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+        }
+        $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        Add-Content -LiteralPath $LogPath -Value "[$timestamp] [OVERLAY] $Message" -Encoding UTF8
+    }
+    catch {
+    }
+}
+
+Write-OverlayLog "Overlay script starting timeout=$Timeout logo=$Logo"
+
+try {
+    Add-Type -AssemblyName PresentationFramework
+    Add-Type -AssemblyName PresentationCore
+    Add-Type -AssemblyName WindowsBase
+    Write-OverlayLog "WPF assemblies loaded"
+}
+catch {
+    Write-OverlayLog "WPF assembly load failed: $($_.Exception.Message)"
+    throw
+}
 
 $script:XInputAvailable = $false
 try {
@@ -75,6 +103,7 @@ public static class LaunchCurtainXInput
 }
 catch {
     $script:XInputAvailable = $false
+    Write-OverlayLog "XInput helper unavailable: $($_.Exception.Message)"
 }
 $script:KeyboardApiAvailable = $script:XInputAvailable
 
@@ -96,6 +125,8 @@ $window.ShowActivated = $false
 $window.Background = [System.Windows.Media.Brushes]::Black
 $window.Opacity = 0
 $window.Focusable = $false
+$hiddenCursor = [System.Windows.Input.Cursors]::None
+$window.Cursor = $hiddenCursor
 
 function Set-WindowNoActivate {
     try {
@@ -134,6 +165,7 @@ function Start-CurtainClose {
     }
 
     $script:isClosing = $true
+    Write-OverlayLog "Overlay closing"
     if ($timer) {
         $timer.Stop()
     }
@@ -150,6 +182,7 @@ function Start-CurtainClose {
 
 $root = New-Object System.Windows.Controls.Grid
 $root.Background = [System.Windows.Media.Brushes]::Black
+$root.Cursor = $hiddenCursor
 $window.Content = $root
 
 $stack = New-Object System.Windows.Controls.StackPanel
@@ -157,6 +190,7 @@ $stack.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Center
 $stack.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
 $stack.Orientation = [System.Windows.Controls.Orientation]::Vertical
 $stack.Margin = New-Object System.Windows.Thickness 0, 0, 0, 0
+$stack.Cursor = $hiddenCursor
 $root.Children.Add($stack) | Out-Null
 
 $fallbackLogoPath = Join-Path (Split-Path -Parent $PSScriptRoot) "assets\base_logo.png"
@@ -177,16 +211,20 @@ foreach ($logoCandidate in $logoCandidates) {
         $image.Width = [Math]::Min($screenWidth * 0.42, 720)
         $image.MaxHeight = [Math]::Min($screenHeight * 0.2, 180)
         $image.Opacity = 0.94
+        $image.Cursor = $hiddenCursor
         $stack.Children.Add($image) | Out-Null
         $logoLoaded = $true
+        Write-OverlayLog "Logo loaded from $logoCandidate"
         break
     }
     catch {
         $logoLoaded = $false
+        Write-OverlayLog "Logo load failed from $logoCandidate : $($_.Exception.Message)"
     }
 }
 
 if (-not $logoLoaded) {
+    Write-OverlayLog "Using text fallback logo"
     $fallback = New-Object System.Windows.Controls.TextBlock
     $fallback.Text = "PLAYHUB"
     $fallback.Foreground = [System.Windows.Media.Brushes]::White
@@ -194,6 +232,7 @@ if (-not $logoLoaded) {
     $fallback.FontSize = 48
     $fallback.FontWeight = [System.Windows.FontWeights]::Bold
     $fallback.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Center
+    $fallback.Cursor = $hiddenCursor
     $stack.Children.Add($fallback) | Out-Null
 }
 
@@ -273,6 +312,7 @@ $window.Add_SourceInitialized({
 
 $window.Add_Loaded({
     Set-WindowNoActivate
+    Write-OverlayLog "Overlay window loaded"
     $screenFade = New-Object System.Windows.Media.Animation.DoubleAnimation
     $screenFade.To = 1
     $screenFade.Duration = New-Object System.Windows.Duration ([TimeSpan]::FromMilliseconds(500))
@@ -281,6 +321,7 @@ $window.Add_Loaded({
 
 $dispatcher = [System.Windows.Threading.Dispatcher]::CurrentDispatcher
 $window.Add_Closed({
+    Write-OverlayLog "Overlay window closed"
     if ($timer) {
         $timer.Stop()
     }

@@ -416,11 +416,15 @@ class PlayButtonLaunchHook {
   private patchedApps: Record<string, unknown> | undefined;
   private methodRestorers: Array<() => void> = [];
   private instantCurtainTimer: number | undefined;
+  private instantCurtainHideTimer: number | undefined;
   private instantCurtainElement: HTMLDivElement | undefined;
   private instantCurtainExpiresAt = 0;
+  private instantCurtainVisible = false;
   private backendLaunchTimer: number | undefined;
   private backendLaunchToken = 0;
   private activeInstantAppId: number | undefined;
+  private prearmedInstantAppId: number | undefined;
+  private prearmLogoToken = 0;
   private gamepadCloseFrame: number | undefined;
   private gamepadClosePressed = false;
   private logoPath = "";
@@ -432,7 +436,10 @@ class PlayButtonLaunchHook {
     }
 
     this.setupDone = true;
+    this.ensureInstantCurtainPrepared();
     document.addEventListener("pointerdown", this.handlePointerDown, true);
+    document.addEventListener("pointerover", this.handlePointerOver, true);
+    document.addEventListener("focusin", this.handleFocusIn, true);
     document.addEventListener("click", this.handleClick, true);
     document.addEventListener("keydown", this.handleKeyDown, true);
     document.addEventListener("visibilitychange", this.handleVisibilityChange);
@@ -443,12 +450,15 @@ class PlayButtonLaunchHook {
 
   cleanup(): void {
     document.removeEventListener("pointerdown", this.handlePointerDown, true);
+    document.removeEventListener("pointerover", this.handlePointerOver, true);
+    document.removeEventListener("focusin", this.handleFocusIn, true);
     document.removeEventListener("click", this.handleClick, true);
     document.removeEventListener("keydown", this.handleKeyDown, true);
     document.removeEventListener("visibilitychange", this.handleVisibilityChange);
     window.removeEventListener("focus", this.handleWindowFocus);
     this.restoreMethodPatches();
     this.hideInstantCurtain();
+    this.destroyInstantCurtain();
     if (this.pollTimer !== undefined) {
       window.clearInterval(this.pollTimer);
       this.pollTimer = undefined;
@@ -460,26 +470,43 @@ class PlayButtonLaunchHook {
 
   setEnabled(enabled: boolean): void {
     this.enabled = enabled;
+    if (!enabled) {
+      this.hideInstantCurtain();
+    }
   }
 
   setLogoPath(path: string): void {
     this.logoPath = path;
+    this.preloadLogo(this.fallbackLogoUrl());
+    this.refreshPreparedFallback();
   }
 
   setDefaultLogoPath(path: string): void {
     this.defaultLogoPath = path;
+    this.preloadLogo(this.fallbackLogoUrl());
+    this.refreshPreparedFallback();
   }
 
   private readonly handlePointerDown = (event: PointerEvent): void => {
     if (this.isPlayButtonEvent(event.target, event.composedPath())) {
+      this.revealInstantCurtain();
       const appId = this.findAppIdForEvent(event.target, event.composedPath());
       const logoSource = appId ? this.findGameLogoSource(appId) : undefined;
       this.trigger("play button pointerdown", appId, logoSource, false);
     }
   };
 
+  private readonly handlePointerOver = (event: PointerEvent): void => {
+    this.prearmFromEvent(event.target, event.composedPath());
+  };
+
+  private readonly handleFocusIn = (event: FocusEvent): void => {
+    this.prearmFromEvent(event.target, event.composedPath());
+  };
+
   private readonly handleClick = (event: MouseEvent): void => {
     if (this.isPlayButtonEvent(event.target, event.composedPath())) {
+      this.revealInstantCurtain();
       const appId = this.findAppIdForEvent(event.target, event.composedPath());
       const logoSource = appId ? this.findGameLogoSource(appId) : undefined;
       this.trigger("play button click", appId, logoSource, false);
@@ -487,7 +514,7 @@ class PlayButtonLaunchHook {
   };
 
   private readonly handleKeyDown = (event: KeyboardEvent): void => {
-    if (event.key === "Escape" && this.instantCurtainElement) {
+    if (event.key === "Escape" && this.instantCurtainVisible) {
       event.preventDefault();
       event.stopPropagation();
       this.requestCloseAllCurtains();
@@ -499,6 +526,7 @@ class PlayButtonLaunchHook {
     }
 
     if (this.isPlayButtonEvent(document.activeElement, [])) {
+      this.revealInstantCurtain();
       const appId = this.findAppIdForEvent(document.activeElement, []);
       const logoSource = appId ? this.findGameLogoSource(appId) : undefined;
       this.trigger("play button keydown", appId, logoSource, false);
@@ -517,6 +545,16 @@ class PlayButtonLaunchHook {
   private readonly handleWindowFocus = (): void => {
     this.hideExpiredInstantCurtain();
   };
+
+  private prearmFromEvent(target: EventTarget | null, composedPath: EventTarget[]): void {
+    if (!this.enabled || this.instantCurtainVisible || !this.isPlayButtonEvent(target, composedPath)) {
+      return;
+    }
+
+    const appId = this.findAppIdForEvent(target, composedPath);
+    const logoSource = appId ? this.findGameLogoSource(appId) : undefined;
+    this.prearmInstantCurtain(appId, logoSource, Boolean(appId && appId >= 2147483648));
+  }
 
   private isPlayButtonEvent(target: EventTarget | null, composedPath: EventTarget[]): boolean {
     const candidates = this.getCandidateElements(target, composedPath);
@@ -1157,93 +1195,148 @@ class PlayButtonLaunchHook {
     this.methodRestorers = [];
   }
 
-  private showInstantCurtain(appId?: number, logoSource?: string, isShortcut = false): void {
-    if (this.instantCurtainElement) {
-      if (appId && this.activeInstantAppId !== appId) {
-        this.updateInstantCurtainLogo(appId, logoSource, isShortcut);
-      }
-      return;
+  private ensureInstantCurtainPrepared(): HTMLDivElement {
+    if (this.instantCurtainElement?.isConnected) {
+      return this.instantCurtainElement;
     }
-
-    const logoUrl = logoSource || (appId && !isShortcut ? this.steamLogoUrl(appId) : this.fallbackLogoUrl());
-    const logoMarkup = this.logoMarkup(logoUrl);
-
-    const style = document.createElement("style");
-    style.textContent = `
-      .launch-curtain-instant {
-        position: fixed;
-        inset: 0;
-        z-index: 2147483647;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        background: #000;
-        color: #fff;
-        opacity: 0;
-        pointer-events: none;
-        transition: opacity 500ms ease;
-      }
-      .launch-curtain-instant__stack {
-        display: flex;
-        flex-direction: column;
-        align-items: center;
-        transform: translateY(-1vh);
-      }
-      .launch-curtain-instant__logo {
-        font-family: "Arial Rounded MT Bold", "Segoe UI", Arial, sans-serif;
-        font-size: min(9vw, 86px);
-        font-weight: 800;
-        letter-spacing: 0;
-        line-height: 1;
-      }
-      .launch-curtain-instant__logo-image {
-        display: block;
-        width: min(42vw, 720px);
-        max-height: min(20vh, 180px);
-        object-fit: contain;
-      }
-      .launch-curtain-instant__fallback-logo {
-        display: none;
-      }
-      .launch-curtain-instant__fallback-logo--visible {
-        display: block;
-      }
-      .launch-curtain-instant__fallback-logo-image {
-        display: block;
-      }
-    `;
 
     const curtain = document.createElement("div");
     curtain.className = "launch-curtain-instant";
-    curtain.appendChild(style);
-    curtain.innerHTML += `
+    curtain.innerHTML = `
+      <style>
+        .launch-curtain-cursor-hidden,
+        .launch-curtain-cursor-hidden * {
+          cursor: none !important;
+        }
+        .launch-curtain-instant {
+          position: fixed;
+          inset: 0;
+          z-index: 2147483647;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          background: #000;
+          color: #fff;
+          opacity: 0;
+          visibility: hidden;
+          pointer-events: none;
+          cursor: none;
+          transition: opacity 500ms ease;
+          will-change: opacity;
+          contain: layout paint style;
+        }
+        .launch-curtain-instant__stack {
+          display: flex;
+          flex-direction: column;
+          align-items: center;
+          transform: translateY(-1vh);
+        }
+        .launch-curtain-instant__logo {
+          font-family: "Arial Rounded MT Bold", "Segoe UI", Arial, sans-serif;
+          font-size: min(9vw, 86px);
+          font-weight: 800;
+          letter-spacing: 0;
+          line-height: 1;
+        }
+        .launch-curtain-instant__logo-image {
+          display: block;
+          width: min(42vw, 720px);
+          max-height: min(20vh, 180px);
+          object-fit: contain;
+        }
+        .launch-curtain-instant__fallback-logo {
+          display: none;
+        }
+        .launch-curtain-instant__fallback-logo--visible {
+          display: block;
+        }
+        .launch-curtain-instant__fallback-logo-image {
+          display: block;
+        }
+      </style>
       <div class="launch-curtain-instant__stack">
         <div class="launch-curtain-instant__logo-slot">
-          ${logoMarkup}
+          ${this.logoMarkup(this.fallbackLogoUrl())}
         </div>
       </div>
     `;
 
     document.documentElement.appendChild(curtain);
     this.instantCurtainElement = curtain;
-    this.activeInstantAppId = appId;
-
     this.wireInstantLogoFallback(curtain);
+    this.preloadLogo(this.fallbackLogoUrl());
+    return curtain;
+  }
 
-    window.requestAnimationFrame(() => {
-      curtain.style.opacity = "1";
+  private prearmInstantCurtain(appId?: number, logoSource?: string, isShortcut = false): void {
+    this.ensureInstantCurtainPrepared();
+    if (this.instantCurtainVisible) {
+      return;
+    }
+
+    if (!appId) {
+      this.prearmedInstantAppId = undefined;
+      this.prearmLogoToken += 1;
+      this.refreshPreparedFallback();
+      return;
+    }
+
+    this.prearmedInstantAppId = appId;
+    const fallbackLogo = isShortcut ? this.fallbackLogoUrl() : this.steamLogoUrl(appId);
+    this.setInstantCurtainLogo(logoSource || fallbackLogo);
+
+    const token = ++this.prearmLogoToken;
+    void this.resolveGameLogoSource(appId, logoSource, isShortcut).then((resolvedLogoSource) => {
+      if (
+        token !== this.prearmLogoToken
+        || this.instantCurtainVisible
+        || this.prearmedInstantAppId !== appId
+        || !resolvedLogoSource
+      ) {
+        return;
+      }
+      this.setInstantCurtainLogo(resolvedLogoSource);
+    }).catch((error) => {
+      console.warn("Launch Curtain prearm logo lookup failed", error);
     });
+  }
 
+  private showInstantCurtain(appId?: number, logoSource?: string, isShortcut = false): void {
+    if (appId) {
+      this.updateInstantCurtainLogo(appId, logoSource, isShortcut);
+    } else if (!this.prearmedInstantAppId && !this.instantCurtainVisible) {
+      this.refreshPreparedFallback();
+    }
+
+    this.revealInstantCurtain();
+  }
+
+  private revealInstantCurtain(): void {
+    if (!this.enabled) {
+      return;
+    }
+
+    const curtain = this.ensureInstantCurtainPrepared();
+    if (this.instantCurtainHideTimer !== undefined) {
+      window.clearTimeout(this.instantCurtainHideTimer);
+      this.instantCurtainHideTimer = undefined;
+    }
     if (this.instantCurtainTimer !== undefined) {
       window.clearTimeout(this.instantCurtainTimer);
     }
+
+    this.instantCurtainVisible = true;
+    document.documentElement.classList.add("launch-curtain-cursor-hidden");
+    curtain.style.visibility = "visible";
+    curtain.style.opacity = "1";
+
     this.instantCurtainExpiresAt = Date.now() + 4200;
     this.instantCurtainTimer = window.setTimeout(() => this.hideInstantCurtain(), 4200);
     this.startGamepadClosePolling();
   }
 
   private hideExpiredInstantCurtain(): void {
-    if (this.instantCurtainExpiresAt > 0 && Date.now() >= this.instantCurtainExpiresAt) {
+    if (this.instantCurtainVisible && this.instantCurtainExpiresAt > 0 && Date.now() >= this.instantCurtainExpiresAt) {
       this.hideInstantCurtain();
     }
   }
@@ -1256,34 +1349,75 @@ class PlayButtonLaunchHook {
     this.stopGamepadClosePolling();
     this.instantCurtainExpiresAt = 0;
     this.activeInstantAppId = undefined;
+    this.prearmedInstantAppId = undefined;
+    this.prearmLogoToken += 1;
 
     const curtain = this.instantCurtainElement;
-    if (!curtain) {
+    if (!curtain || !this.instantCurtainVisible) {
+      document.documentElement.classList.remove("launch-curtain-cursor-hidden");
       return;
     }
 
+    this.instantCurtainVisible = false;
     curtain.style.opacity = "0";
-    this.instantCurtainElement = undefined;
-    window.setTimeout(() => {
-      curtain.remove();
+    this.instantCurtainHideTimer = window.setTimeout(() => {
+      this.instantCurtainHideTimer = undefined;
+      if (this.instantCurtainVisible) {
+        return;
+      }
+      curtain.style.visibility = "hidden";
+      document.documentElement.classList.remove("launch-curtain-cursor-hidden");
+      this.refreshPreparedFallback();
     }, 550);
   }
 
+  private destroyInstantCurtain(): void {
+    if (this.instantCurtainTimer !== undefined) {
+      window.clearTimeout(this.instantCurtainTimer);
+      this.instantCurtainTimer = undefined;
+    }
+    if (this.instantCurtainHideTimer !== undefined) {
+      window.clearTimeout(this.instantCurtainHideTimer);
+      this.instantCurtainHideTimer = undefined;
+    }
+    this.stopGamepadClosePolling();
+    document.documentElement.classList.remove("launch-curtain-cursor-hidden");
+    this.instantCurtainElement?.remove();
+    this.instantCurtainElement = undefined;
+    this.instantCurtainVisible = false;
+    this.activeInstantAppId = undefined;
+    this.prearmedInstantAppId = undefined;
+    this.prearmLogoToken += 1;
+  }
+
   private updateInstantCurtainLogo(appId: number, logoSource?: string, isShortcut = false): void {
-    const curtain = this.instantCurtainElement;
-    if (!curtain) {
+    const logoUrl = logoSource || (isShortcut ? this.fallbackLogoUrl() : this.steamLogoUrl(appId));
+    if (!logoUrl) {
       return;
     }
 
-    const logoUrl = logoSource || (isShortcut ? this.fallbackLogoUrl() : this.steamLogoUrl(appId));
+    this.setInstantCurtainLogo(logoUrl);
+    this.activeInstantAppId = appId;
+    this.prearmedInstantAppId = undefined;
+  }
+
+  private setInstantCurtainLogo(logoUrl: string): void {
+    const curtain = this.ensureInstantCurtainPrepared();
     const slot = curtain.querySelector<HTMLElement>(".launch-curtain-instant__logo-slot");
-    if (!slot || !logoUrl) {
+    if (!slot) {
       return;
     }
 
     slot.innerHTML = this.logoMarkup(logoUrl);
-    this.activeInstantAppId = appId;
     this.wireInstantLogoFallback(curtain);
+    this.preloadLogo(logoUrl);
+  }
+
+  private refreshPreparedFallback(): void {
+    if (this.instantCurtainVisible || this.prearmedInstantAppId) {
+      return;
+    }
+    this.setInstantCurtainLogo(this.fallbackLogoUrl());
   }
 
   private logoMarkup(logoUrl: string): string {
@@ -1311,12 +1445,21 @@ class PlayButtonLaunchHook {
     }
   }
 
+  private preloadLogo(logoUrl: string): void {
+    if (!logoUrl || (!/^https?:\/\//i.test(logoUrl) && !logoUrl.startsWith("file://"))) {
+      return;
+    }
+    const image = new Image();
+    image.decoding = "async";
+    image.src = logoUrl;
+  }
+
   private startGamepadClosePolling(): void {
     this.stopGamepadClosePolling();
     this.gamepadClosePressed = false;
 
     const poll = (): void => {
-      if (!this.instantCurtainElement) {
+      if (!this.instantCurtainVisible) {
         this.stopGamepadClosePolling();
         return;
       }
@@ -1396,24 +1539,40 @@ function notify(result: ActionResult, strings: I18n): void {
 function Content() {
   const strings = getStrings();
   const [settings, setSettings] = useState<Settings | undefined>(undefined);
-  const [status, setStatus] = useState<Status | undefined>(undefined);
+  const [, setStatus] = useState<Status | undefined>(undefined);
   const [busy, setBusy] = useState(false);
 
   const refresh = async (): Promise<void> => {
-    const nextStatus = await getStatus();
-    setStatus(nextStatus);
+    try {
+      const nextStatus = await getStatus();
+      setStatus(nextStatus);
+    } catch (error) {
+      console.warn("Launch Curtain could not refresh status", error);
+    }
   };
 
   useEffect(() => {
     let mounted = true;
 
     const load = async (): Promise<void> => {
-      const [nextSettings, nextStatus] = await Promise.all([getSettings(), getStatus()]);
-      if (mounted) {
-        playButtonHook.setLogoPath(nextSettings.custom_logo_path ?? "");
-        playButtonHook.setDefaultLogoPath(nextSettings.default_logo_path ?? "");
-        setSettings(nextSettings);
-        setStatus(nextStatus);
+      try {
+        const nextSettings = await getSettings();
+        if (mounted) {
+          playButtonHook.setLogoPath(nextSettings.custom_logo_path ?? "");
+          playButtonHook.setDefaultLogoPath(nextSettings.default_logo_path ?? "");
+          setSettings(nextSettings);
+        }
+      } catch (error) {
+        console.warn("Launch Curtain could not load settings", error);
+      }
+
+      try {
+        const nextStatus = await getStatus();
+        if (mounted) {
+          setStatus(nextStatus);
+        }
+      } catch (error) {
+        console.warn("Launch Curtain could not load status", error);
       }
     };
 
@@ -1437,12 +1596,18 @@ function Content() {
     try {
       const result = checked ? await startAutoMode() : await stopAutoMode();
       notify(result, strings);
-      const [nextSettings, nextStatus] = await Promise.all([getSettings(), getStatus()]);
+      const nextSettings = await getSettings();
       playButtonHook.setEnabled(Boolean(nextSettings.auto_mode));
       playButtonHook.setLogoPath(nextSettings.custom_logo_path ?? "");
       playButtonHook.setDefaultLogoPath(nextSettings.default_logo_path ?? "");
       setSettings(nextSettings);
-      setStatus(nextStatus);
+      await refresh();
+    } catch (error) {
+      console.warn("Launch Curtain could not change auto mode", error);
+      toaster.toast({
+        title: strings.toastAttention,
+        body: "Could not change Launch Curtain settings."
+      });
     } finally {
       setBusy(false);
     }
@@ -1529,7 +1694,7 @@ function Content() {
           <ToggleField
             label={strings.autoLaunchCurtain}
             checked={Boolean(settings?.auto_mode)}
-            disabled={busy || !status?.is_windows}
+            disabled={busy}
             onChange={(checked) => {
               void setAutoMode(checked);
             }}
